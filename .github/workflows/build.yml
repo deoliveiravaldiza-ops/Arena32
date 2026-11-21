@@ -1,0 +1,517 @@
+name: Compilar APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Criar os arquivos do app
+        run: |
+          set -e
+          mkdir -p app
+          mkdir -p app/src/main
+          mkdir -p app/src/main/java/com/arena32
+          cat > settings.gradle <<'EOF_ARENA'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Arena32"
+          include ':app'
+          EOF_ARENA
+          cat > build.gradle <<'EOF_ARENA'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_ARENA
+          cat > gradle.properties <<'EOF_ARENA'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF_ARENA
+          cat > app/build.gradle <<'EOF_ARENA'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.arena32'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.arena32'
+                  // Android 5.0+ cobre praticamente todos os celulares de 32 bits ainda em uso.
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+          // Sem código nativo (só Java + OpenGL ES 2.0): o mesmo APK roda em
+          // armeabi-v7a (32 bits), arm64-v8a, x86 e x86_64.
+          EOF_ARENA
+          cat > app/src/main/AndroidManifest.xml <<'EOF_ARENA'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Arena 32"
+                  android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_ARENA
+          cat > app/src/main/java/com/arena32/Input.java <<'EOF_ARENA'
+          package com.arena32;
+
+          /** Estado dos controles (toque e teclado). Escrito pela interface, lido pelo jogo. */
+          public class Input {
+              public volatile float touchX, touchY;
+              public volatile boolean touchFire, keyFire;
+              public volatile boolean kW, kA, kS, kD, turnL, turnR, lookU, lookD;
+
+              private float lx, ly;
+
+              public synchronized void addLook(float dx, float dy) {
+                  lx += dx;
+                  ly += dy;
+              }
+
+              public synchronized float takeLookX() {
+                  float v = lx;
+                  lx = 0;
+                  return v;
+              }
+
+              public synchronized float takeLookY() {
+                  float v = ly;
+                  ly = 0;
+                  return v;
+              }
+
+              private static float clamp(float v) {
+                  return v > 1f ? 1f : (v < -1f ? -1f : v);
+              }
+
+              public float moveX() {
+                  return clamp(touchX + (kD ? 1f : 0f) - (kA ? 1f : 0f));
+              }
+
+              public float moveY() {
+                  return clamp(touchY + (kW ? 1f : 0f) - (kS ? 1f : 0f));
+              }
+
+              public float turn() {
+                  return (turnR ? 1f : 0f) - (turnL ? 1f : 0f);
+              }
+
+              public float tilt() {
+                  return (lookU ? 1f : 0f) - (lookD ? 1f : 0f);
+              }
+
+              public boolean fire() {
+                  return touchFire || keyFire;
+              }
+          }
+          EOF_ARENA
+          cat > app/src/main/java/com/arena32/Net.java <<'EOF_ARENA'
+          package com.arena32;
+
+          import java.net.DatagramPacket;
+          import java.net.DatagramSocket;
+          import java.net.InetAddress;
+          import java.net.InetSocketAddress;
+          import java.util.Locale;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /**
+           * Multiplayer na rede local (Wi-Fi) por UDP broadcast, sem servidor.
+           * Cada aparelho envia seu estado ~15 vezes por segundo e cada um decide
+           * o dano que recebe (mensagem H quando um tiro acerta outro jogador).
+           *
+           * S|id|x|z|yaw|pitch|tiros|vida|abates|mortes   estado do jogador
+           * H|alvo|dano|atirador                           tiro acertou o alvo
+           * K|atirador                                     o alvo morreu, credite o abate
+           */
+          public class Net {
+              public static final int PORT = 47777;
+
+              public final ConcurrentLinkedQueue<String> inbox = new ConcurrentLinkedQueue<String>();
+
+              private DatagramSocket socket;
+              private InetAddress target;
+              private volatile boolean running;
+              private ExecutorService sender;
+
+              public boolean start(InetAddress broadcast) {
+                  try {
+                      target = broadcast;
+                      socket = new DatagramSocket(null);
+                      socket.setReuseAddress(true);
+                      socket.setBroadcast(true);
+                      socket.bind(new InetSocketAddress(PORT));
+                      running = true;
+                      sender = Executors.newSingleThreadExecutor();
+                      Thread rx = new Thread(new Runnable() {
+                          public void run() {
+                              receiveLoop();
+                          }
+                      }, "net-rx");
+                      rx.setDaemon(true);
+                      rx.start();
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              private void receiveLoop() {
+                  byte[] buf = new byte[256];
+                  DatagramPacket p = new DatagramPacket(buf, buf.length);
+                  while (running) {
+                      try {
+                          p.setLength(buf.length);
+                          socket.receive(p);
+                          if (inbox.size() < 512) {
+                              inbox.add(new String(p.getData(), 0, p.getLength(), "UTF-8"));
+                          }
+                      } catch (Exception e) {
+                          if (!running) break;
+                      }
+                  }
+              }
+
+              private void send(final String msg) {
+                  if (!running) return;
+                  try {
+                      sender.execute(new Runnable() {
+                          public void run() {
+                              try {
+                                  byte[] b = msg.getBytes("UTF-8");
+                                  socket.send(new DatagramPacket(b, b.length, target, PORT));
+                              } catch (Exception ignored) {
+                              }
+                          }
+                      });
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              public void sendState(World.Ent e) {
+                  send(String.format(Locale.US, "S|%d|%.2f|%.2f|%.3f|%.3f|%d|%.0f|%d|%d",
+                          e.id, e.x, e.z, e.yaw, e.pitch, e.shots, e.hp, e.kills, e.deaths));
+              }
+
+              public void sendHit(int targetId, float dmg, int shooterId) {
+                  send(String.format(Locale.US, "H|%d|%.0f|%d", targetId, dmg, shooterId));
+              }
+
+              public void sendKill(int shooterId) {
+                  send("K|" + shooterId);
+              }
+
+              public void stop() {
+                  running = false;
+                  if (socket != null) socket.close();
+                  if (sender != null) sender.shutdownNow();
+              }
+          }
+          EOF_ARENA
+          cat > app/src/main/java/com/arena32/World.java <<'EOF_ARENA'
+          package com.arena32;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Random;
+
+          /** Regras do jogo: arena, jogadores, bots, tiros e dano. Java puro, sem Android. */
+          public class World {
+              public static final float HALF = 32f;
+              public static final float RADIUS = 0.45f;
+              public static final float DAMAGE = 25f;
+              public static final float BULLET_SPEED = 70f;
+              public static final int BOTS = 5;
+
+              public static class Box {
+                  public final float x, z, hw, hd, h;
+
+                  Box(float x, float z, float hw, float hd, float h) {
+                      this.x = x;
+                      this.z = z;
+                      this.hw = hw;
+                      this.hd = hd;
+                      this.h = h;
+                  }
+              }
+
+              public static class Ent {
+                  public int id;
+                  public boolean bot, remote, alive = true;
+                  public float x, z, yaw, pitch, hp = 100f, cool, respawn, think, strafe, tx, tz;
+                  public int kills, deaths, shots;
+                  public long lastSeen;
+                  public String name = "";
+              }
+
+              public static class Bullet {
+                  public float x, y, z, dx, dy, dz, life;
+                  public int owner;
+                  public boolean visualOnly;
+              }
+
+              public final List<Box> walls = new ArrayList<Box>();
+              public final List<Ent> ents = new ArrayList<Ent>();
+              public final List<Bullet> bullets = new ArrayList<Bullet>();
+              public final Ent me = new Ent();
+
+              public volatile Net net;
+              public volatile String netStatus = "Rede local: procurando...";
+              public volatile int playerCount = 1;
+              public volatile float flash;
+
+              private final Random rnd = new Random();
+              private float sendTimer;
+
+              // x, z, meia-largura, meia-profundidade, altura
+              private static final float[][] CRATES = {
+                      {0, 0, 3, 3, 3},
+                      {-14, -10, 2, 2, 2},
+                      {14, 10, 2, 2, 2},
+                      {-14, 12, 2, 5, 2.5f},
+                      {14, -12, 2, 5, 2.5f},
+                      {0, -20, 6, 1, 2},
+                      {0, 20, 6, 1, 2},
+                      {-22, 0, 1.5f, 1.5f, 3.5f},
+                      {22, 0, 1.5f, 1.5f, 3.5f},
+                      {-6, -8, 1, 1, 1.4f},
+                      {6, 8, 1, 1, 1.4f},
+                      {8, -6, 1, 1, 1.4f},
+                      {-8, 6, 1, 1, 1.4f}
+              };
+
+              private static final float[][] SPAWNS = {
+                      {-26, -26}, {26, 26}, {26, -26}, {-26, 26},
+                      {0, -27}, {0, 27}, {-27, 0}, {27, 0}
+              };
+
+              public World() {
+                  walls.add(new Box(0, -HALF - 1, HALF + 2, 1, 5));
+                  walls.add(new Box(0, HALF + 1, HALF + 2, 1, 5));
+                  walls.add(new Box(-HALF - 1, 0, 1, HALF + 2, 5));
+                  walls.add(new Box(HALF + 1, 0, 1, HALF + 2, 5));
+                  for (int i = 0; i < CRATES.length; i++) {
+                      float[] c = CRATES[i];
+                      walls.add(new Box(c[0], c[1], c[2], c[3], c[4]));
+                  }
+                  me.id = 1 + rnd.nextInt(2000000000);
+                  me.name = "Voce";
+                  ents.add(me);
+                  spawn(me);
+                  for (int i = 0; i < BOTS; i++) {
+                      Ent b = new Ent();
+                      b.bot = true;
+                      b.id = -(i + 1);
+                      b.name = "Bot " + (i + 1);
+                      ents.add(b);
+                      spawn(b);
+                  }
+              }
+
+              private void spawn(Ent e) {
+                  float[] s = SPAWNS[rnd.nextInt(SPAWNS.length)];
+                  e.x = e.tx = s[0];
+                  e.z = e.tz = s[1];
+                  e.hp = 100f;
+                  e.alive = true;
+                  e.cool = 0.5f;
+                  e.pitch = 0f;
+                  e.yaw = (float) Math.atan2(-s[0], s[1]);
+              }
+
+              private Ent find(int id) {
+                  for (int i = 0; i < ents.size(); i++) {
+                      if (ents.get(i).id == id) return ents.get(i);
+                  }
+                  return null;
+              }
+
+              // ---------- colisão ----------
+
+              private boolean blocked(float x, float z) {
+                  for (int i = 0; i < walls.size(); i++) {
+                      Box b = walls.get(i);
+                      if (Math.abs(x - b.x) < b.hw + RADIUS && Math.abs(z - b.z) < b.hd + RADIUS) return true;
+                  }
+                  return false;
+              }
+
+              private void move(Ent e, float dx, float dz) {
+                  if (!blocked(e.x + dx, e.z)) e.x += dx;
+                  if (!blocked(e.x, e.z + dz)) e.z += dz;
+              }
+
+              private boolean solid(float x, float y, float z) {
+                  for (int i = 0; i < walls.size(); i++) {
+                      Box b = walls.get(i);
+                      if (Math.abs(x - b.x) < b.hw && Math.abs(z - b.z) < b.hd && y < b.h) return true;
+                  }
+                  return false;
+              }
+
+              private boolean clearLine(float x0, float z0, float x1, float z1) {
+                  float dx = x1 - x0, dz = z1 - z0;
+                  int n = (int) (Math.sqrt(dx * dx + dz * dz) / 0.8f) + 1;
+                  for (int i = 1; i < n; i++) {
+                      float t = (float) i / n;
+                      if (solid(x0 + dx * t, 1.3f, z0 + dz * t)) return false;
+                  }
+                  return true;
+              }
+
+              private static float wrap(float a) {
+                  final float pi = (float) Math.PI;
+                  while (a > pi) a -= 2f * pi;
+                  while (a < -pi) a += 2f * pi;
+                  return a;
+              }
+
+              // ---------- tiros ----------
+
+              private void spawnBullet(float x, float z, float yaw, float pitch, int owner, boolean visualOnly) {
+                  float cp = (float) Math.cos(pitch);
+                  float dx = (float) Math.sin(yaw) * cp;
+                  float dy = (float) Math.sin(pitch);
+                  float dz = -(float) Math.cos(yaw) * cp;
+                  Bullet b = new Bullet();
+                  b.x = x + dx * 0.6f;
+                  b.y = 1.5f + dy * 0.6f;
+                  b.z = z + dz * 0.6f;
+                  b.dx = dx * BULLET_SPEED;
+                  b.dy = dy * BULLET_SPEED;
+                  b.dz = dz * BULLET_SPEED;
+                  b.life = 1.5f;
+                  b.owner = owner;
+                  b.visualOnly = visualOnly;
+                  bullets.add(b);
+              }
+
+              private void shoot(Ent e, float spread) {
+                  e.cool = e.bot ? 0.45f : 0.18f;
+                  e.shots++;
+                  float jy = (rnd.nextFloat() - 0.5f) * spread;
+                  float jp = (rnd.nextFloat() - 0.5f) * spread;
+                  spawnBullet(e.x, e.z, e.yaw + jy, e.pitch + jp, e.id, false);
+              }
+
+              private void damage(Ent e, float dmg, Ent shooter) {
+                  if (!e.alive) return;
+                  if (e == me) flash = 0.3f;
+                  e.hp -= dmg;
+                  if (e.hp <= 0) {
+                      e.hp = 0;
+                      e.alive = false;
+                      e.deaths++;
+                      e.respawn = 3f;
+                      if (shooter != null && shooter != e) {
+                          shooter.kills++;
+                          Net n = net;
+                          if (shooter.remote && e == me && n != null) n.sendKill(shooter.id);
+                      }
+                  }
+              }
+
+              private boolean hitEnts(Bullet b) {
+                  if (b.visualOnly || b.y < 0f || b.y > 1.8f) return false;
+                  for (int i = 0; i < ents.size(); i++) {
+                      Ent e = ents.get(i);
+                      if (!e.alive || e.id == b.owner) continue;
+                      float dx = e.x - b.x, dz = e.z - b.z;
+                      if (dx * dx + dz * dz < 0.36f) {
+                          if (e.remote) {
+                              Net n = net;
+                              if (n != null && b.owner == me.id) n.sendHit(e.id, DAMAGE, me.id);
+                          } else {
+                              damage(e, DAMAGE, find(b.owner));
+                          }
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+
+              private void updateBullets(float dt) {
+                  for (int i = bullets.size() - 1; i >= 0; i--) {
+                      Bullet b = bullets.get(i);
+                      boolean dead = false;
+                      for (int s = 0; s < 2 && !dead; s++) {
+                          b.x += b.dx * dt * 0.5f;
+                          b.y += b.dy * dt * 0.5f;
+                          b.z += b.dz * dt * 0.5f;
+                          if (b.y < 0f || solid(b.x, b.y, b.z)) dead = true;
+                          else dead = hitEnts(b);
+                      }
+                      b.life -= dt;
+                      if (b.life <= 0f) dead = true;
+                      if (dead) bullets.remove(i);
+                  }
+              }
+
+              // ---------- bots ----------
+
+              private void botThink(Ent b, float dt) {
+                  Ent t = null;
+                  float best = 1e9f;
+                  for (int i = 0; i < ents.size();
